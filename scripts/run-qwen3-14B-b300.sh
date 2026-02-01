@@ -4,45 +4,60 @@
 # ref: https://github.com/radixark/miles/issues/530
 # ref: https://github.com/radixark/miles/issues/533
 
-set -ex
+# --- Host-side launcher ---
+# If not running inside a container, pull the B300 image and re-execute
+# this script inside it.
+if [ ! -f /.dockerenv ]; then
+   set -ex
 
-IMAGE=fy121415/miles:b300
-CONTAINER_NAME=qwen3-14b-b300
-DATA_DIR=${DATA_DIR:-/root}
+   IMAGE=fy121415/miles:b300
+   CONTAINER_NAME=qwen3-14b-b300
+   DATA_DIR=${DATA_DIR:-/root}
+   SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
-docker pull "$IMAGE"
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+   docker pull "$IMAGE"
+   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-docker run --rm \
-   --gpus all \
-   --ipc=host \
-   --network=host \
-   --name "$CONTAINER_NAME" \
-   -v "$DATA_DIR":/data \
-   "$IMAGE" \
-   bash -s <<'EOF'
+   docker run --rm \
+      -i \
+      --gpus all \
+      --ipc=host \
+      --network=host \
+      --name "$CONTAINER_NAME" \
+      -v "$DATA_DIR":/data \
+      -v "$SCRIPT_DIR":/root/miles/scripts \
+      "$IMAGE" \
+      bash /root/miles/scripts/run-qwen3-14B-b300.sh
+
+   exit $?
+fi
+
+# --- Container-side training ---
+
+# for rerun the task
+pkill -9 sglang
+sleep 3
+ray stop --force
+pkill -9 ray
+pkill -9 python
+sleep 3
+pkill -9 ray
+pkill -9 python
+
 set -ex
 
 export PYTHONUNBUFFERED=1
 
-MODEL_ARGS=(
-   --swiglu
-   --num-layers 40
-   --hidden-size 5120
-   --ffn-hidden-size 17408
-   --num-attention-heads 40
-   --group-query-attention
-   --num-query-groups 8
-   --use-rotary-position-embeddings
-   --disable-bias-linear
-   --normalization "RMSNorm"
-   --norm-epsilon 1e-6
-   --rotary-base 1000000
-   --vocab-size 151936
-   --kv-channels 128
-   --qk-layernorm
-   --untie-embeddings-and-output-weights
-)
+NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+if [ "$NVLINK_COUNT" -gt 0 ]; then
+    HAS_NVLINK=1
+else
+    HAS_NVLINK=0
+fi
+echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/models/qwen3-14B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint /data/Qwen3-14B
@@ -127,27 +142,33 @@ SGLANG_ARGS=(
 )
 
 MISC_ARGS=(
+   # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0
+   # should be good for model performance
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
+   # need to comment this when using model with MLA
    --attention-backend flash
 )
 
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+# launch the master node of ray in container
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-RUNTIME_ENV_JSON='{
-  "env_vars": {
-    "PYTHONPATH": "/root/Megatron-LM/",
-    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-    "NCCL_NVLS_ENABLE": "1",
-    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false"
+# Build the runtime environment JSON with proper variable substitution
+RUNTIME_ENV_JSON="{
+  \"env_vars\": {
+    \"PYTHONPATH\": \"/root/Megatron-LM/\",
+    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK\": \"false\"
   }
-}'
+}"
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+   --working-dir /root/miles \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 8 \
@@ -162,4 +183,3 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]}
-EOF
